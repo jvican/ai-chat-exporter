@@ -64,14 +64,14 @@
     sanitizeFilename(text) {
       return text
         .replace(/[\\/:*?"<>|.]/g, '')
-        .replace(/\s+/g, '_')
-        .replace(/^_+|_+$/g, '');
+        .replace(/[\s_]+/g, ' ')
+        .trim();
     },
 
     getDateString() {
       const d = new Date();
       const pad = n => n.toString().padStart(2, '0');
-      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+      return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())} ${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
     },
 
     removeCitations(text) {
@@ -378,26 +378,25 @@
     generateFilename(customFilename, conversationTitle) {
       // Priority: custom > conversation title > page title > timestamp
       if (customFilename && customFilename.trim()) {
-        let base = customFilename.trim().replace(/\.[^/.]+$/, '');
-        base = base.replace(/[^a-zA-Z0-9_\-]/g, '_');
-        return base || `gemini_chat_export_${Utils.getDateString()}`;
+        const base = Utils.sanitizeFilename(customFilename.trim().replace(/\.[^/.]+$/, ''));
+        return base || `gemini chat export ${Utils.getDateString()}`;
       }
 
       // Try conversation title first
       if (conversationTitle) {
         const safeTitle = Utils.sanitizeFilename(conversationTitle);
-        if (safeTitle) return `${safeTitle}_${Utils.getDateString()}`;
+        if (safeTitle) return `${safeTitle} ${Utils.getDateString()}`;
       }
 
       // Fallback to page title
       const pageTitle = document.querySelector('title')?.textContent.trim();
       if (pageTitle) {
         const safeTitle = Utils.sanitizeFilename(pageTitle);
-        if (safeTitle) return `${safeTitle}_${Utils.getDateString()}`;
+        if (safeTitle) return `${safeTitle} ${Utils.getDateString()}`;
       }
 
       // Final fallback
-      return `gemini_chat_export_${Utils.getDateString()}`;
+      return `gemini chat export ${Utils.getDateString()}`;
     }
 
     async buildMarkdown(turns, conversationTitle) {

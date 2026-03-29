@@ -19,27 +19,15 @@
 
     SELECTORS: {
       CHAT_CONTAINER_CANDIDATES: [
-        '.flex-1.flex.flex-col.px-4.max-w-3xl.mx-auto.w-full.pt-1',
-        'main .flex-1.overflow-y-auto',
+        'main',
         'main .overflow-y-auto',
-        'div[data-testid="chat-messages"]',
         'div[role="log"]'
       ],
       TURN_CANDIDATES: [
-        'div[data-testid="chat-message"]',
-        'div[data-testid="message"]',
-        'div[data-testid="chat-message-row"]',
-        'div[data-testid="chat-message-container"]',
-        'article'
+        'div[data-test-render-count]'
       ],
-      CONTENT_CANDIDATES: [
-        'div[data-testid="message-content"]',
-        'div[data-testid="chat-message-content"]',
-        'div.markdown',
-        'div.prose',
-        'div[class*="markdown"]',
-        'div[class*="prose"]'
-      ],
+      USER_MESSAGE: '[data-testid="user-message"]',
+      ASSISTANT_CONTENT: '.standard-markdown',
       TITLE_CANDIDATES: [
         'main h1',
         'header h1',
@@ -86,14 +74,14 @@
     sanitizeFilename(text) {
       return text
         .replace(/[\\/:*?"<>|.]/g, '')
-        .replace(/\s+/g, '_')
-        .replace(/^_+|_+$/g, '');
+        .replace(/[\s_]+/g, ' ')
+        .trim();
     },
 
     getDateString() {
       const d = new Date();
       const pad = n => n.toString().padStart(2, '0');
-      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
     },
 
     normalizeWhitespace(text) {
@@ -384,47 +372,24 @@
     }
 
     resolveRole(messageEl) {
-      if (messageEl.querySelector('[data-testid="user-message"]')) {
-        return 'user';
-      }
-      if (messageEl.querySelector('[data-testid="assistant-message"]')) {
-        return 'assistant';
-      }
-
-      const directRole = messageEl.getAttribute('data-message-author-role')
-        || messageEl.getAttribute('data-role')
-        || messageEl.getAttribute('data-author')
-        || messageEl.dataset?.messageAuthorRole
-        || messageEl.dataset?.role
-        || messageEl.dataset?.author;
-
-      const normalize = value => (value || '').toLowerCase();
-      const roleValue = normalize(directRole);
-      if (roleValue.includes('assistant') || roleValue.includes('claude') || roleValue.includes('model')) {
-        return 'assistant';
-      }
-      if (roleValue.includes('user') || roleValue.includes('human')) {
+      // Check for user message marker
+      if (messageEl.querySelector(CONFIG.SELECTORS.USER_MESSAGE)) {
         return 'user';
       }
 
-      const roleMarker = messageEl.querySelector('[data-message-author-role],[data-role],[data-author]');
-      if (roleMarker) {
-        const markerValue = normalize(roleMarker.getAttribute('data-message-author-role')
-          || roleMarker.getAttribute('data-role')
-          || roleMarker.getAttribute('data-author'));
-        if (markerValue.includes('assistant') || markerValue.includes('claude') || markerValue.includes('model')) {
-          return 'assistant';
-        }
-        if (markerValue.includes('user') || markerValue.includes('human')) {
-          return 'user';
-        }
+      // Check for assistant message marker (data-is-streaming attribute)
+      if (messageEl.querySelector('[data-is-streaming]')) {
+        return 'assistant';
       }
 
-      const testId = normalize(messageEl.getAttribute('data-testid'));
-      if (testId.includes('assistant') || testId.includes('claude')) return 'assistant';
-      if (testId.includes('user') || testId.includes('human')) return 'user';
+      // Check if it has standard-markdown (assistant content)
+      if (messageEl.querySelector(CONFIG.SELECTORS.ASSISTANT_CONTENT)) {
+        return 'assistant';
+      }
 
-      if (messageEl.querySelector('button[aria-label*="Copy"], button[title*="Copy"]')) {
+      // Fallback: check for copy buttons (likely assistant message with code)
+      const copyButtons = messageEl.querySelectorAll('button[aria-label*="Copy"]');
+      if (copyButtons.length > 0) {
         return 'assistant';
       }
 
@@ -432,21 +397,33 @@
     }
 
     findContentElement(messageEl) {
-      for (const selector of CONFIG.SELECTORS.CONTENT_CANDIDATES) {
-        const content = messageEl.querySelector(selector);
-        if (content) return content;
-      }
+      // Check for user message content
+      const userContent = messageEl.querySelector(CONFIG.SELECTORS.USER_MESSAGE);
+      if (userContent) return userContent;
+
+      // Check for assistant message content
+      const assistantContent = messageEl.querySelector(CONFIG.SELECTORS.ASSISTANT_CONTENT);
+      if (assistantContent) return assistantContent;
+
+      // Fallback to the message element itself
       return messageEl;
     }
 
     findCopyButton(messageEl) {
-      const buttons = Array.from(messageEl.querySelectorAll('button'));
-      return buttons.find(button => {
-        const text = (button.textContent || '').toLowerCase();
-        const aria = (button.getAttribute('aria-label') || '').toLowerCase();
-        const title = (button.getAttribute('title') || '').toLowerCase();
-        return text.includes('copy') || aria.includes('copy') || title.includes('copy');
-      }) || null;
+      // Look for copy buttons - prioritize message-level copy over code block copy
+      const buttons = Array.from(messageEl.querySelectorAll('button[aria-label*="Copy"]'));
+
+      // First, try to find a copy button that's not in a code block
+      const nonCodeCopyButton = buttons.find(button => {
+        const codeBlock = button.closest('.group\\/copy');
+        return !codeBlock;
+      });
+
+      if (nonCodeCopyButton) return nonCodeCopyButton;
+
+      // If no message-level copy button found, return null
+      // (we'll use text extraction instead)
+      return null;
     }
 
     async copyFromButton(button) {
@@ -479,17 +456,16 @@
       const timestamp = Utils.getDateString();
 
       if (custom?.trim()) {
-        let base = custom.trim().replace(/\.[^/.]+$/, '');
-        base = base.replace(/[^a-zA-Z0-9_\-]/g, '_');
-        return base || `claude_chat_export_${timestamp}`;
+        const base = Utils.sanitizeFilename(custom.trim().replace(/\.[^/.]+$/, ''));
+        return base || `claude chat export ${timestamp}`;
       }
 
       if (title) {
         const safe = Utils.sanitizeFilename(title);
-        if (safe) return `${safe}_${timestamp}`;
+        if (safe) return `${safe} ${timestamp}`;
       }
 
-      return `claude_chat_export_${timestamp}`;
+      return `claude chat export ${timestamp}`;
     }
 
     async buildMarkdown(messages, title) {

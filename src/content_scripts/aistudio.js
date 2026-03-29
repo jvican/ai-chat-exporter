@@ -102,12 +102,12 @@ addExportButton({
  */
 async function aistudioExportMain() {
   /**
-   * Returns a YYYYMMDD_HHMMSS string for filenames.
+   * Returns a YYYYMMDD HHMMSS string for filenames.
    */
   function getDateString() {
     const now = new Date();
     const pad = n => n.toString().padStart(2, '0');
-    return `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())}_${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
+    return `${now.getFullYear()}${pad(now.getMonth()+1)}${pad(now.getDate())} ${pad(now.getHours())}${pad(now.getMinutes())}${pad(now.getSeconds())}`;
   }
   function sleep(ms) { return new Promise(r => setTimeout(r, ms)); }
   let markdown = `# AI Studio Chat Export\n\n> Exported on: ${new Date().toLocaleString()}\n\n---\n\n`;
@@ -226,7 +226,7 @@ async function aistudioExportMain() {
     }
     markdown += '---\n\n';
   }
-  const filename = `aistudio_chat_export_${getDateString()}.md`;
+  const filename = `aistudio chat export ${getDateString()}.md`;
 
   // Download as Markdown file
   const blob = new Blob([markdown], { type: 'text/markdown' });

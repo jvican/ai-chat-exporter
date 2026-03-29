@@ -20,9 +20,14 @@
     EXPORT_MODE_NAME: 'chatgpt-export-mode',
 
     SELECTORS: {
-      CONVERSATION_TURN: 'article[data-testid^="conversation-turn-"]',
+      CONVERSATION_TURNS: [
+        'section[data-testid^="conversation-turn-"][data-turn]',
+        'article[data-testid^="conversation-turn-"]'
+      ],
       USER_HEADING: 'h5.sr-only',
       MODEL_HEADING: 'h6.sr-only',
+      MESSAGE_NODE: '[data-message-author-role]',
+      ASSISTANT_MARKDOWN: '[data-message-author-role="assistant"] .markdown',
       COPY_BUTTON: 'button[data-testid="copy-turn-action-button"]',
       THREAD_TITLE: 'main h1'
     },
@@ -73,14 +78,14 @@
     sanitizeFilename(text) {
       return text
         .replace(/[\\/:*?"<>|.]/g, '')
-        .replace(/\s+/g, '_')
-        .replace(/^_+|_+$/g, '');
+        .replace(/[\s_]+/g, ' ')
+        .trim();
     },
 
     getDateString() {
       const d = new Date();
       const pad = n => n.toString().padStart(2, '0');
-      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())}_${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
+      return `${d.getFullYear()}-${pad(d.getMonth() + 1)}-${pad(d.getDate())} ${pad(d.getHours())}${pad(d.getMinutes())}${pad(d.getSeconds())}`;
     },
 
     createNotification(message) {
@@ -102,6 +107,22 @@
       document.body.appendChild(popup);
       setTimeout(() => popup.remove(), CONFIG.TIMING.POPUP_DURATION);
       return popup;
+    },
+
+    getConversationTurns() {
+      const seen = new Set();
+      const turns = [];
+
+      CONFIG.SELECTORS.CONVERSATION_TURNS.forEach(selector => {
+        document.querySelectorAll(selector).forEach(turn => {
+          if (!seen.has(turn)) {
+            seen.add(turn);
+            turns.push(turn);
+          }
+        });
+      });
+
+      return turns;
     }
   };
 
@@ -109,6 +130,24 @@
   // CHECKBOX MANAGER
   // ============================================================================
   class CheckboxManager {
+    resolveTurnRole(turn) {
+      const turnRole = turn.dataset.turn;
+      if (turnRole === 'user') return 'user';
+      if (turnRole === 'assistant') return 'model';
+
+      const messageRole = turn.querySelector(CONFIG.SELECTORS.MESSAGE_NODE)?.dataset.messageAuthorRole;
+      if (messageRole === 'user') return 'user';
+      if (messageRole === 'assistant') return 'model';
+
+      const userHeading = turn.querySelector(CONFIG.SELECTORS.USER_HEADING);
+      if (userHeading) return 'user';
+
+      const modelHeading = turn.querySelector(CONFIG.SELECTORS.MODEL_HEADING);
+      if (modelHeading) return 'model';
+
+      return null;
+    }
+
     create(turn, type, topOffset) {
       const checkbox = document.createElement('input');
       checkbox.type = 'checkbox';
@@ -133,17 +172,12 @@
     }
 
     injectCheckboxes() {
-      const turns = document.querySelectorAll(CONFIG.SELECTORS.CONVERSATION_TURN);
+      const turns = Utils.getConversationTurns();
 
       turns.forEach(turn => {
-        const userHeading = turn.querySelector(CONFIG.SELECTORS.USER_HEADING);
-        if (userHeading && !turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.user`)) {
-          this.create(turn, 'user', '8px');
-        }
-
-        const modelHeading = turn.querySelector(CONFIG.SELECTORS.MODEL_HEADING);
-        if (modelHeading && !turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.model`)) {
-          this.create(turn, 'model', '36px');
+        const role = this.resolveTurnRole(turn);
+        if (role && !turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.${role}`)) {
+          this.create(turn, role, '8px');
         }
       });
     }
@@ -179,6 +213,14 @@
           break;
       }
       this.lastSelection = value;
+    }
+
+    syncWithDropdown() {
+      const dropdown = document.getElementById(CONFIG.SELECT_DROPDOWN_ID);
+      const value = dropdown?.value || this.lastSelection;
+      if (value && value !== 'custom') {
+        this.apply(value);
+      }
     }
 
     resetDropdown() {
@@ -293,13 +335,17 @@
       this.checkboxManager = checkboxManager;
     }
 
+    getTurns() {
+      return Utils.getConversationTurns();
+    }
+
     getChatContainer() {
       for (const selector of CONFIG.CHAT_CONTAINER_CANDIDATES) {
         const el = document.querySelector(selector);
         if (el) return el;
       }
 
-      const firstTurn = document.querySelector(CONFIG.SELECTORS.CONVERSATION_TURN);
+      const firstTurn = this.getTurns()[0];
       if (firstTurn) {
         const overflowAncestor = firstTurn.closest('div.overflow-y-auto, div.flex-1, main');
         if (overflowAncestor) return overflowAncestor;
@@ -320,11 +366,11 @@
       let lastScrollTop = null;
 
       while (stableScrolls < CONFIG.TIMING.MAX_STABLE_SCROLLS && attempts < CONFIG.TIMING.MAX_SCROLL_ATTEMPTS) {
-        const currentTurnCount = document.querySelectorAll(CONFIG.SELECTORS.CONVERSATION_TURN).length;
+        const currentTurnCount = this.getTurns().length;
         container.scrollTop = 0;
         await Utils.sleep(CONFIG.TIMING.SCROLL_DELAY);
 
-        const newTurnCount = document.querySelectorAll(CONFIG.SELECTORS.CONVERSATION_TURN).length;
+        const newTurnCount = this.getTurns().length;
         const currentTop = container.scrollTop;
 
         if (newTurnCount === currentTurnCount && (lastScrollTop === currentTop || currentTop === 0)) {
@@ -370,17 +416,32 @@
       const baseTimestamp = Utils.getDateString();
 
       if (custom?.trim()) {
-        let base = custom.trim().replace(/\.[^/.]+$/, '');
-        base = base.replace(/[^a-zA-Z0-9_\-]/g, '_');
-        return base || `chatgpt_chat_export_${baseTimestamp}`;
+        const base = Utils.sanitizeFilename(custom.trim().replace(/\.[^/.]+$/, ''));
+        return base || `chatgpt chat export ${baseTimestamp}`;
       }
 
       if (title) {
         const safe = Utils.sanitizeFilename(title);
-        if (safe) return `${safe}_${baseTimestamp}`;
+        if (safe) return `${safe} ${baseTimestamp}`;
       }
 
-      return `chatgpt_chat_export_${baseTimestamp}`;
+      return `chatgpt chat export ${baseTimestamp}`;
+    }
+
+    getMessageNode(turn) {
+      return turn.querySelector(CONFIG.SELECTORS.MESSAGE_NODE);
+    }
+
+    getMessageText(turn, role) {
+      const messageNode = this.getMessageNode(turn);
+      if (!messageNode) return '';
+
+      if (role === 'model') {
+        const markdownNode = turn.querySelector(CONFIG.SELECTORS.ASSISTANT_MARKDOWN);
+        return markdownNode?.textContent?.trim() || messageNode.textContent?.trim() || '';
+      }
+
+      return messageNode.textContent?.trim() || '';
     }
 
     async buildMarkdown(turns, title) {
@@ -393,27 +454,28 @@
         const turn = turns[i];
         Utils.createNotification(`Processing message ${i + 1} of ${turns.length}...`);
 
-        // User content comes after the sr-only heading element
-        const userHeading = turn.querySelector(CONFIG.SELECTORS.USER_HEADING);
         const userCheckbox = turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.user`);
-        if (userHeading && userCheckbox?.checked) {
-          const userContent = userHeading.nextElementSibling?.textContent?.trim();
+        if (userCheckbox?.checked) {
+          const userContent = this.getMessageText(turn, 'user');
           markdown += userContent
             ? `## 👤 You\n\n${userContent}\n\n`
             : `## 👤 You\n\n[Could not read your message for turn ${i + 1}.]\n\n`;
         }
 
-        const modelHeading = turn.querySelector(CONFIG.SELECTORS.MODEL_HEADING);
         const modelCheckbox = turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.model`);
-        if (modelHeading && modelCheckbox?.checked) {
+        if (modelCheckbox?.checked) {
           const copyBtn = turn.querySelector(CONFIG.SELECTORS.COPY_BUTTON);
           if (copyBtn) {
             const clipboardText = await this.copyModelResponse(copyBtn);
-            markdown += clipboardText
-              ? `## 🤖 ChatGPT\n\n${clipboardText}\n\n`
+            const modelContent = clipboardText || this.getMessageText(turn, 'model');
+            markdown += modelContent
+              ? `## 🤖 ChatGPT\n\n${modelContent}\n\n`
               : `## 🤖 ChatGPT\n\n[Could not copy the response for turn ${i + 1}.]\n\n`;
           } else {
-            markdown += `## 🤖 ChatGPT\n\n[Copy button not available for turn ${i + 1}.]\n\n`;
+            const modelContent = this.getMessageText(turn, 'model');
+            markdown += modelContent
+              ? `## 🤖 ChatGPT\n\n${modelContent}\n\n`
+              : `## 🤖 ChatGPT\n\n[Copy button not available for turn ${i + 1}.]\n\n`;
           }
         }
 
@@ -443,16 +505,26 @@
       }, 1000);
     }
 
-    async execute(mode, customFilename) {
+    async execute(mode, customFilename, selectionMode = 'all') {
       await this.scrollToLoadAll();
       this.checkboxManager.injectCheckboxes();
-
-      if (!this.checkboxManager.anyChecked()) {
-        alert('Please select at least one message to export.');
-        return;
+      if (selectionMode && selectionMode !== 'custom') {
+        document.querySelectorAll(`.${CONFIG.CHECKBOX_CLASS}`).forEach(cb => {
+          if (selectionMode === 'all') cb.checked = true;
+          if (selectionMode === 'ai') cb.checked = cb.classList.contains('model');
+          if (selectionMode === 'none') cb.checked = false;
+        });
       }
 
-      const turns = Array.from(document.querySelectorAll(CONFIG.SELECTORS.CONVERSATION_TURN));
+      const turns = this.getTurns();
+      if (turns.length === 0) {
+        throw new Error('Could not find any ChatGPT conversation turns on this page.');
+      }
+
+      if (!this.checkboxManager.anyChecked()) {
+        throw new Error('Messages were found, but the exporter could not classify them for selection.');
+      }
+
       const title = this.getConversationTitle();
       const markdown = await this.buildMarkdown(turns, title);
       const filenameBase = this.generateFilename(customFilename, title);
@@ -529,6 +601,7 @@
 
     async handleButtonClick() {
       this.checkboxManager.injectCheckboxes();
+      this.selectionManager.syncWithDropdown();
 
       if (this.dropdown.style.display === 'none') {
         this.dropdown.style.display = '';
@@ -541,10 +614,11 @@
 
       try {
         const mode = this.dropdown.querySelector(`input[name="${CONFIG.EXPORT_MODE_NAME}"]:checked`)?.value || 'file';
+        const selectionMode = this.dropdown.querySelector(`#${CONFIG.SELECT_DROPDOWN_ID}`)?.value || this.selectionManager.lastSelection;
         const filenameInput = this.dropdown.querySelector(`#${CONFIG.FILENAME_INPUT_ID}`);
         const customFilename = mode === 'file' ? filenameInput?.value?.trim() || '' : '';
 
-        await this.exportService.execute(mode, customFilename);
+        await this.exportService.execute(mode, customFilename, selectionMode);
 
         this.checkboxManager.removeAll();
         this.selectionManager.resetDropdown();
