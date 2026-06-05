@@ -22,7 +22,12 @@
       CONVERSATION_TURN: 'div.conversation-container',
       USER_QUERY: 'user-query',
       MODEL_RESPONSE: 'model-response',
-      COPY_BUTTON: 'button[data-test-id="copy-button"]',
+      COPY_BUTTON: [
+        'copy-button button[aria-label="Copy"]',
+        'copy-button button',
+        '[data-test-id="copy-button"] button',
+        'button[aria-label="Copy"]'
+      ].join(', '),
       CONVERSATION_TITLE: '.conversation-title'
     },
     
@@ -342,7 +347,34 @@
       }
     }
 
-    async copyModelResponse(turn, copyBtn) {
+    findCopyButton(turn, modelRespElem) {
+      const directButton = modelRespElem.querySelector(CONFIG.SELECTORS.COPY_BUTTON);
+      if (directButton) return directButton;
+
+      const responseRect = modelRespElem.getBoundingClientRect();
+      const buttons = Array.from(turn.querySelectorAll(CONFIG.SELECTORS.COPY_BUTTON))
+        .map(button => ({ button, rect: button.getBoundingClientRect() }))
+        .filter(({ rect }) => rect.width > 0 && rect.height > 0)
+        .filter(({ rect }) => rect.top >= responseRect.top - 8)
+        .filter(({ rect }) => rect.top <= responseRect.bottom + 96);
+
+      const scopedButton = buttons
+        .sort((a, b) => Math.abs(a.rect.top - responseRect.bottom) - Math.abs(b.rect.top - responseRect.bottom))[0]
+        ?.button;
+      if (scopedButton) return scopedButton;
+
+      const pageButtons = Array.from(document.querySelectorAll(CONFIG.SELECTORS.COPY_BUTTON))
+        .map(button => ({ button, rect: button.getBoundingClientRect() }))
+        .filter(({ rect }) => rect.width > 0 && rect.height > 0)
+        .filter(({ rect }) => rect.top >= responseRect.top - 8)
+        .filter(({ rect }) => rect.top <= responseRect.bottom + 96);
+
+      return pageButtons
+        .sort((a, b) => Math.abs(a.rect.top - responseRect.bottom) - Math.abs(b.rect.top - responseRect.bottom))[0]
+        ?.button || null;
+    }
+
+    async copyModelResponse(modelRespElem, copyBtn) {
       try {
         await navigator.clipboard.writeText('');
       } catch (e) {
@@ -353,10 +385,7 @@
       let clipboardText = '';
 
       while (attempts < CONFIG.TIMING.MAX_CLIPBOARD_ATTEMPTS) {
-        const modelRespElem = turn.querySelector(CONFIG.SELECTORS.MODEL_RESPONSE);
-        if (modelRespElem) {
-          modelRespElem.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
-        }
+        modelRespElem.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
         
         await Utils.sleep(CONFIG.TIMING.CLIPBOARD_CLEAR_DELAY);
         copyBtn.click();
@@ -426,9 +455,9 @@
             modelRespElem.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
             await Utils.sleep(CONFIG.TIMING.MOUSEOVER_DELAY);
             
-            const copyBtn = turn.querySelector(CONFIG.SELECTORS.COPY_BUTTON);
+            const copyBtn = this.findCopyButton(turn, modelRespElem);
             if (copyBtn) {
-              const clipboardText = await this.copyModelResponse(turn, copyBtn);
+              const clipboardText = await this.copyModelResponse(modelRespElem, copyBtn);
               
               if (clipboardText) {
                 const modelResponse = Utils.removeCitations(clipboardText);
@@ -619,21 +648,42 @@
     }
 
     observeStorageChanges() {
+      let observer = null;
+      const stopObserving = () => {
+        if (observer) observer.disconnect();
+      };
+
       const updateVisibility = () => {
         try {
           if (chrome?.storage?.sync) {
             chrome.storage.sync.get(['hideExportBtn'], (result) => {
-              this.button.style.display = result.hideExportBtn ? 'none' : '';
+              try {
+                if (chrome.runtime?.lastError) {
+                  stopObserving();
+                  return;
+                }
+                this.button.style.display = result.hideExportBtn ? 'none' : '';
+              } catch (e) {
+                if (e.message?.includes('Extension context invalidated')) {
+                  stopObserving();
+                  return;
+                }
+                console.error('Storage access error:', e);
+              }
             });
           }
         } catch (e) {
+          if (e.message?.includes('Extension context invalidated')) {
+            stopObserving();
+            return;
+          }
           console.error('Storage access error:', e);
         }
       };
 
       updateVisibility();
 
-      const observer = new MutationObserver(updateVisibility);
+      observer = new MutationObserver(updateVisibility);
       observer.observe(document.body, { childList: true, subtree: true });
 
       if (chrome?.storage?.onChanged) {
