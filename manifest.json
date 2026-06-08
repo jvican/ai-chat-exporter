@@ -5,12 +5,19 @@
   "version": "3.3.0",
   "permissions": [
     "clipboardRead",
+    "clipboardWrite",
     "storage"
   ],
   "host_permissions": [
   "https://gemini.google.com/*",
   "https://chatgpt.com/*",
   "https://claude.ai/*"
+  ],
+  "web_accessible_resources": [
+    {
+      "resources": ["src/content_scripts/chatgpt_clipboard_capture.js"],
+      "matches": ["https://chatgpt.com/*"]
+    }
   ],
   "icons": {
     "16": "icons/icon16.png",

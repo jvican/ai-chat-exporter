@@ -24,10 +24,10 @@
         'section[data-testid^="conversation-turn-"][data-turn]',
         'article[data-testid^="conversation-turn-"]'
       ],
-      USER_HEADING: 'h5.sr-only',
-      MODEL_HEADING: 'h6.sr-only',
       MESSAGE_NODE: '[data-message-author-role]',
       ASSISTANT_MARKDOWN: '[data-message-author-role="assistant"] .markdown',
+      ASSISTANT_TEXT: '[data-message-author-role="assistant"], .markdown, .prose',
+      USER_TEXT: '[data-message-author-role="user"] .whitespace-pre-wrap, .whitespace-pre-wrap',
       COPY_BUTTON: 'button[data-testid="copy-turn-action-button"]',
       THREAD_TITLE: 'main h1'
     },
@@ -46,10 +46,12 @@
       MAX_SCROLL_ATTEMPTS: 60,
       MAX_STABLE_SCROLLS: 4,
       CLIPBOARD_CLEAR_DELAY: 150,
-      CLIPBOARD_READ_DELAY: 300,
-      MAX_CLIPBOARD_ATTEMPTS: 10,
+      CLIPBOARD_CAPTURE_TIMEOUT: 3000,
       POPUP_DURATION: 1000
     },
+
+    DEBUG_COPY_CAPTURE: false,
+    DEBUG_TURNS: false,
 
     STYLES: {
       BUTTON_PRIMARY: '#1a73e8',
@@ -110,19 +112,34 @@
     },
 
     getConversationTurns() {
+      return Utils.getAllConversationTurnCandidates();
+    },
+
+    getAllConversationTurnCandidates() {
       const seen = new Set();
       const turns = [];
 
       CONFIG.SELECTORS.CONVERSATION_TURNS.forEach(selector => {
         document.querySelectorAll(selector).forEach(turn => {
-          if (!seen.has(turn)) {
-            seen.add(turn);
-            turns.push(turn);
-          }
+          if (seen.has(turn)) return;
+          seen.add(turn);
+          turns.push(turn);
         });
       });
 
-      return turns;
+      return turns.sort((a, b) => {
+        const position = a.compareDocumentPosition(b);
+        if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
+        if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
+        return 0;
+      });
+    },
+
+    normalizeText(text) {
+      return (text || '')
+        .replace(/\u00a0/g, ' ')
+        .replace(/[ \t]+\n/g, '\n')
+        .trim();
     }
   };
 
@@ -131,19 +148,23 @@
   // ============================================================================
   class CheckboxManager {
     resolveTurnRole(turn) {
-      const turnRole = turn.dataset.turn;
-      if (turnRole === 'user') return 'user';
-      if (turnRole === 'assistant') return 'model';
-
       const messageRole = turn.querySelector(CONFIG.SELECTORS.MESSAGE_NODE)?.dataset.messageAuthorRole;
       if (messageRole === 'user') return 'user';
       if (messageRole === 'assistant') return 'model';
 
-      const userHeading = turn.querySelector(CONFIG.SELECTORS.USER_HEADING);
-      if (userHeading) return 'user';
+      const turnRole = turn.dataset.turn;
+      if (turnRole === 'user' && turn.querySelector(CONFIG.SELECTORS.USER_TEXT)) return 'user';
+      if (turnRole === 'assistant' && (
+        turn.querySelector(CONFIG.SELECTORS.ASSISTANT_MARKDOWN) ||
+        turn.querySelector(CONFIG.SELECTORS.ASSISTANT_TEXT)
+      )) return 'model';
 
-      const modelHeading = turn.querySelector(CONFIG.SELECTORS.MODEL_HEADING);
-      if (modelHeading) return 'model';
+      if (turn.querySelector(CONFIG.SELECTORS.ASSISTANT_MARKDOWN) ||
+          turn.querySelector(CONFIG.SELECTORS.ASSISTANT_TEXT)) {
+        return 'model';
+      }
+
+      if (turn.querySelector(CONFIG.SELECTORS.USER_TEXT)) return 'user';
 
       return null;
     }
@@ -339,6 +360,34 @@
       return Utils.getConversationTurns();
     }
 
+    getMessageRecords() {
+      return Array.from(document.querySelectorAll(CONFIG.SELECTORS.MESSAGE_NODE))
+        .map((node, index) => {
+          const authorRole = node.dataset.messageAuthorRole;
+          const role = authorRole === 'assistant'
+            ? 'model'
+            : authorRole === 'user'
+              ? 'user'
+              : null;
+
+          if (!role) return null;
+
+          return {
+            index,
+            node,
+            role,
+            turn: this.getTurnForMessageNode(node)
+          };
+        })
+        .filter(Boolean);
+    }
+
+    getTurnForMessageNode(node) {
+      return CONFIG.SELECTORS.CONVERSATION_TURNS
+        .map(selector => node.closest(selector))
+        .find(Boolean) || node;
+    }
+
     getChatContainer() {
       for (const selector of CONFIG.CHAT_CONTAINER_CANDIDATES) {
         const el = document.querySelector(selector);
@@ -384,26 +433,270 @@
       }
     }
 
-    async copyModelResponse(copyButton) {
-      try {
-        await navigator.clipboard.writeText('');
-      } catch (e) {
-        // Ignore clipboard clear errors
-      }
+    getMessageRecordKey(record) {
+      const turnId = record.turn?.getAttribute?.('data-testid') || '';
+      if (turnId) return `${record.role}:${turnId}`;
 
-      let attempts = 0;
-      while (attempts < CONFIG.TIMING.MAX_CLIPBOARD_ATTEMPTS) {
-        copyButton.click();
-        await Utils.sleep(CONFIG.TIMING.CLIPBOARD_READ_DELAY);
-        const text = await navigator.clipboard.readText();
-        if (text) {
-          return text;
+      const text = Utils.normalizeText(record.node.textContent || '');
+      return `${record.role}:${text.slice(0, 240)}`;
+    }
+
+    getTurnNumber(record) {
+      const turnId = record.turn?.getAttribute?.('data-testid') || '';
+      const match = turnId.match(/conversation-turn-(\d+)/);
+      return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+    }
+
+    shouldIncludeRecord(record, selectionMode) {
+      if (selectionMode === 'none') return false;
+      if (selectionMode === 'ai') return record.role === 'model';
+      if (selectionMode === 'custom') return this.isMessageSelected(record);
+      return true;
+    }
+
+    async collectMessageSnapshots(selectionMode = 'all') {
+      const container = this.getChatContainer();
+      const scrollTargets = Utils.getAllConversationTurnCandidates();
+      const snapshotsByKey = new Map();
+
+      this.logTurn('snapshot collection start', {
+        wrappers: scrollTargets.length,
+        mountedMessageNodes: this.getMessageRecords().length,
+        selectionMode
+      });
+
+      const collectMounted = async source => {
+        const records = this.getMessageRecords();
+        this.logTurn('snapshot collection mounted records', {
+          source,
+          count: records.length,
+          roles: records.map(record => record.role)
+        });
+
+        for (const record of records) {
+          const key = this.getMessageRecordKey(record);
+          if (!this.shouldIncludeRecord(record, selectionMode)) {
+            this.logTurn('snapshot skipped by selection', {
+              source,
+              key,
+              role: record.role,
+              testId: record.turn?.getAttribute?.('data-testid') || ''
+            });
+            continue;
+          }
+
+          if (snapshotsByKey.has(key)) {
+            this.logTurn('snapshot duplicate skipped', {
+              source,
+              key,
+              role: record.role,
+              testId: record.turn?.getAttribute?.('data-testid') || ''
+            });
+            continue;
+          }
+
+          const ordinal = snapshotsByKey.size + 1;
+          const turnNumber = this.getTurnNumber(record);
+
+          if (record.role === 'user') {
+            const content = this.getMessageText(record.node, 'user');
+            this.logTurn('snapshot user', {
+              ordinal,
+              key,
+              turnNumber,
+              contentLength: content.length,
+              testId: record.turn?.getAttribute?.('data-testid') || ''
+            });
+            snapshotsByKey.set(key, { role: 'user', content, key, turnNumber });
+            continue;
+          }
+
+          const copyBtn = this.findCopyButton(record);
+          const fallbackText = this.getMessageText(record.node, 'model');
+          this.logTurn('snapshot assistant before copy', {
+            ordinal,
+            key,
+            turnNumber,
+            hasResolvedCopyButton: Boolean(copyBtn),
+            fallbackTextLength: fallbackText.length,
+            testId: record.turn?.getAttribute?.('data-testid') || ''
+          });
+
+          const clipboardText = copyBtn ? await this.copyModelResponse(copyBtn) : '';
+          const content = clipboardText || fallbackText;
+          this.logTurn('snapshot assistant after copy', {
+            ordinal,
+            key,
+            turnNumber,
+            clipboardTextLength: clipboardText.length,
+            finalContentLength: content.length,
+            usedFallback: !clipboardText && Boolean(content)
+          });
+          snapshotsByKey.set(key, { role: 'model', content, key, turnNumber });
         }
-        attempts++;
-        await Utils.sleep(CONFIG.TIMING.CLIPBOARD_CLEAR_DELAY);
+      };
+
+      await collectMounted('initial');
+
+      for (let i = 0; i < scrollTargets.length; i++) {
+        scrollTargets[i].scrollIntoView({ block: 'center', inline: 'nearest' });
+        await Utils.sleep(300);
+        await collectMounted(`scroll-${i + 1}`);
       }
 
-      return '';
+      if (container) {
+        container.scrollTop = container.scrollHeight;
+        await Utils.sleep(250);
+        await collectMounted('bottom');
+      }
+
+      const snapshots = Array.from(snapshotsByKey.values())
+        .sort((a, b) => a.turnNumber - b.turnNumber);
+
+      this.logTurn('snapshot collection complete', {
+        snapshots: snapshots.length,
+        roles: snapshots.map(snapshot => snapshot.role),
+        turnNumbers: snapshots.map(snapshot => snapshot.turnNumber),
+        keys: snapshots.map(snapshot => snapshot.key)
+      });
+
+      return snapshots;
+    }
+
+    logCopyCapture(message, details) {
+      if (!CONFIG.DEBUG_COPY_CAPTURE) return;
+      console.log('[ChatGPT Exporter copy capture]', message, details || '');
+    }
+
+    logTurn(message, details) {
+      if (!CONFIG.DEBUG_TURNS) return;
+      console.log('[ChatGPT Exporter turn]', message, details || '');
+    }
+
+    async ensureCopyCaptureManager() {
+      if (this.copyCaptureManagerReady) return true;
+
+      return new Promise(resolve => {
+        const timeout = setTimeout(() => {
+          window.removeEventListener('message', handleMessage);
+          this.logCopyCapture('manager load timeout');
+          resolve(false);
+        }, 3000);
+
+        const handleMessage = event => {
+          if (event.source !== window) return;
+          const data = event.data;
+          if (!data || data.source !== 'chatgpt-exporter' || data.type !== 'manager-ready') return;
+
+          clearTimeout(timeout);
+          window.removeEventListener('message', handleMessage);
+          this.copyCaptureManagerReady = true;
+          this.logCopyCapture('manager ready');
+          resolve(true);
+        };
+
+        window.addEventListener('message', handleMessage);
+
+        const existingScript = document.querySelector('script[data-chatgpt-exporter-copy-manager="true"]');
+        if (existingScript) {
+          window.postMessage({ source: 'chatgpt-exporter', type: 'manager-ping' }, '*');
+          return;
+        }
+
+        const script = document.createElement('script');
+        try {
+          script.src = chrome.runtime.getURL('src/content_scripts/chatgpt_clipboard_capture.js');
+        } catch (error) {
+          clearTimeout(timeout);
+          window.removeEventListener('message', handleMessage);
+          this.logCopyCapture('manager getURL error', error);
+          resolve(false);
+          return;
+        }
+        script.dataset.chatgptExporterCopyManager = 'true';
+        script.onerror = () => {
+          clearTimeout(timeout);
+          window.removeEventListener('message', handleMessage);
+          this.logCopyCapture('manager script load error');
+          resolve(false);
+        };
+        (document.head || document.documentElement).appendChild(script);
+      });
+    }
+
+    async restoreCopyCaptureManager() {
+      if (!this.copyCaptureManagerReady) return;
+      window.postMessage({ source: 'chatgpt-exporter', type: 'restore-capture' }, '*');
+      this.copyCaptureManagerReady = false;
+      this.logCopyCapture('manager restore requested');
+    }
+
+    async copyModelResponse(copyButton) {
+      const managerReady = await this.ensureCopyCaptureManager();
+      if (!managerReady) return '';
+
+      const attemptCapture = attemptNumber => new Promise(resolve => {
+        const requestId = `chatgpt-export-copy-${Date.now()}-${Math.random().toString(36).slice(2)}`;
+        const timeoutMs = CONFIG.TIMING.CLIPBOARD_CAPTURE_TIMEOUT;
+        let settled = false;
+        let sawClipboardCall = false;
+        const watchdog = setTimeout(() => finish('', 'content watchdog timeout'), timeoutMs + 1000);
+
+        const cleanup = () => {
+          clearTimeout(watchdog);
+          window.removeEventListener('message', handleMessage);
+          window.postMessage({ source: 'chatgpt-exporter', type: 'disarm-capture', requestId }, '*');
+        };
+
+        const finish = (text, reason) => {
+          if (settled) return;
+          settled = true;
+          cleanup();
+          this.logCopyCapture(reason, {
+            attempt: attemptNumber,
+            requestId,
+            textLength: text?.length || 0,
+            sawClipboardCall
+          });
+          resolve(text || '');
+        };
+
+        const handleMessage = event => {
+          if (event.source !== window) return;
+          const data = event.data;
+          if (!data || data.source !== 'chatgpt-exporter' || data.requestId !== requestId) return;
+
+          if (data.type === 'clipboard-captured') {
+            sawClipboardCall = true;
+            finish(data.text, 'captured');
+          } else if (data.type === 'clipboard-capture-armed') {
+            try {
+              this.logCopyCapture('native copy click', { attempt: attemptNumber, requestId });
+              copyButton.click();
+            } catch (error) {
+              finish('', 'native copy click failed');
+            }
+          } else if (data.type === 'clipboard-capture-timeout') {
+            finish('', 'capture timeout');
+          }
+        };
+
+        window.addEventListener('message', handleMessage);
+
+        this.logCopyCapture('arm capture', { attempt: attemptNumber, requestId, timeoutMs });
+        window.postMessage({
+          source: 'chatgpt-exporter',
+          type: 'arm-capture',
+          requestId,
+          timeoutMs
+        }, '*');
+      });
+
+      const firstCapture = await attemptCapture(1);
+      if (firstCapture) return firstCapture;
+
+      await Utils.sleep(CONFIG.TIMING.CLIPBOARD_CLEAR_DELAY);
+      return attemptCapture(2);
     }
 
     getConversationTitle() {
@@ -428,59 +721,109 @@
       return `chatgpt chat export ${baseTimestamp}`;
     }
 
-    getMessageNode(turn) {
-      return turn.querySelector(CONFIG.SELECTORS.MESSAGE_NODE);
+    getMessageNode(turnOrNode) {
+      if (turnOrNode?.matches?.(CONFIG.SELECTORS.MESSAGE_NODE)) return turnOrNode;
+      return turnOrNode?.querySelector?.(CONFIG.SELECTORS.MESSAGE_NODE) || null;
     }
 
-    getMessageText(turn, role) {
-      const messageNode = this.getMessageNode(turn);
-      if (!messageNode) return '';
-
-      if (role === 'model') {
-        const markdownNode = turn.querySelector(CONFIG.SELECTORS.ASSISTANT_MARKDOWN);
-        return markdownNode?.textContent?.trim() || messageNode.textContent?.trim() || '';
-      }
-
-      return messageNode.textContent?.trim() || '';
+    getVisibleText(el) {
+      if (!el) return '';
+      const clone = el.cloneNode(true);
+      clone.querySelectorAll([
+        `.${CONFIG.CHECKBOX_CLASS}`,
+        'button',
+        'svg',
+        'path',
+        'script',
+        'style',
+        'noscript'
+      ].join(',')).forEach(node => node.remove());
+      return Utils.normalizeText(clone.textContent);
     }
 
-    async buildMarkdown(turns, title) {
+    getUserText(turnOrNode, messageNode) {
+      const scopedUserNode = messageNode?.dataset.messageAuthorRole === 'user'
+        ? messageNode
+        : turnOrNode?.matches?.('[data-message-author-role="user"]')
+          ? turnOrNode
+          : null;
+      const userTextNode = scopedUserNode?.querySelector(CONFIG.SELECTORS.USER_TEXT) ||
+        turnOrNode.querySelector?.('[data-message-author-role="user"]') ||
+        turnOrNode.querySelector?.(CONFIG.SELECTORS.USER_TEXT);
+
+      return this.getVisibleText(userTextNode || scopedUserNode);
+    }
+
+    getModelText(turnOrNode, messageNode) {
+      const markdownNode = turnOrNode.querySelector?.(CONFIG.SELECTORS.ASSISTANT_MARKDOWN) ||
+        (turnOrNode.matches?.('.markdown') ? turnOrNode : null);
+      const assistantNode = messageNode?.dataset.messageAuthorRole === 'assistant'
+        ? messageNode
+        : turnOrNode.matches?.('[data-message-author-role="assistant"]')
+          ? turnOrNode
+          : turnOrNode.querySelector?.('[data-message-author-role="assistant"]');
+      const assistantTextNode = turnOrNode.querySelector?.(CONFIG.SELECTORS.ASSISTANT_TEXT);
+
+      return this.getVisibleText(markdownNode || assistantNode || assistantTextNode || turnOrNode);
+    }
+
+    getMessageText(turnOrNode, role) {
+      const messageNode = this.getMessageNode(turnOrNode);
+      return role === 'model'
+        ? this.getModelText(turnOrNode, messageNode)
+        : this.getUserText(turnOrNode, messageNode);
+    }
+
+    findCopyButton(messageRecord) {
+      const target = messageRecord.node;
+      const turn = messageRecord.turn || target;
+
+      target.scrollIntoView({ block: 'center', inline: 'nearest' });
+      target.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+      target.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+      turn.dispatchEvent(new MouseEvent('mouseover', { bubbles: true }));
+      turn.dispatchEvent(new MouseEvent('mouseenter', { bubbles: true }));
+
+      const scopedButton = turn.querySelector(CONFIG.SELECTORS.COPY_BUTTON);
+      if (scopedButton) return scopedButton;
+
+      const turnRect = target.getBoundingClientRect();
+      const visibleButtons = Array.from(document.querySelectorAll(CONFIG.SELECTORS.COPY_BUTTON))
+        .map(button => ({ button, rect: button.getBoundingClientRect() }))
+        .filter(({ rect }) => rect.width > 0 && rect.height > 0)
+        .filter(({ rect }) => rect.top >= turnRect.top - 24)
+        .filter(({ rect }) => rect.top <= turnRect.bottom + 96);
+
+      return visibleButtons
+        .sort((a, b) => Math.abs(a.rect.top - turnRect.bottom) - Math.abs(b.rect.top - turnRect.bottom))[0]
+        ?.button || null;
+    }
+
+    isMessageSelected(record) {
+      const checkboxRole = record.role === 'model' ? 'model' : 'user';
+      const checkbox = record.turn?.querySelector?.(`.${CONFIG.CHECKBOX_CLASS}.${checkboxRole}`);
+      return checkbox?.checked ?? true;
+    }
+
+    buildMarkdownFromSnapshots(snapshots, title) {
       let markdown = title
         ? `# ${title}\n\n`
         : '# ChatGPT Chat Export\n\n';
       markdown += `> Exported on: ${new Date().toLocaleString()}\n\n---\n\n`;
 
-      for (let i = 0; i < turns.length; i++) {
-        const turn = turns[i];
-        Utils.createNotification(`Processing message ${i + 1} of ${turns.length}...`);
-
-        const userCheckbox = turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.user`);
-        if (userCheckbox?.checked) {
-          const userContent = this.getMessageText(turn, 'user');
-          markdown += userContent
-            ? `## 👤 You\n\n${userContent}\n\n`
-            : `## 👤 You\n\n[Could not read your message for turn ${i + 1}.]\n\n`;
-        }
-
-        const modelCheckbox = turn.querySelector(`.${CONFIG.CHECKBOX_CLASS}.model`);
-        if (modelCheckbox?.checked) {
-          const copyBtn = turn.querySelector(CONFIG.SELECTORS.COPY_BUTTON);
-          if (copyBtn) {
-            const clipboardText = await this.copyModelResponse(copyBtn);
-            const modelContent = clipboardText || this.getMessageText(turn, 'model');
-            markdown += modelContent
-              ? `## 🤖 ChatGPT\n\n${modelContent}\n\n`
-              : `## 🤖 ChatGPT\n\n[Could not copy the response for turn ${i + 1}.]\n\n`;
-          } else {
-            const modelContent = this.getMessageText(turn, 'model');
-            markdown += modelContent
-              ? `## 🤖 ChatGPT\n\n${modelContent}\n\n`
-              : `## 🤖 ChatGPT\n\n[Copy button not available for turn ${i + 1}.]\n\n`;
-          }
+      snapshots.forEach((snapshot, index) => {
+        if (snapshot.role === 'user') {
+          markdown += snapshot.content
+            ? `## 👤 You\n\n${snapshot.content}\n\n`
+            : `## 👤 You\n\n[Could not read your message for turn ${index + 1}.]\n\n`;
+        } else {
+          markdown += snapshot.content
+            ? `## 🤖 ChatGPT\n\n${snapshot.content}\n\n`
+            : `## 🤖 ChatGPT\n\n[Could not copy the response for turn ${index + 1}.]\n\n`;
         }
 
         markdown += '---\n\n';
-      }
+      });
 
       return markdown;
     }
@@ -506,30 +849,35 @@
     }
 
     async execute(mode, customFilename, selectionMode = 'all') {
-      await this.scrollToLoadAll();
-      this.checkboxManager.injectCheckboxes();
-      if (selectionMode && selectionMode !== 'custom') {
-        document.querySelectorAll(`.${CONFIG.CHECKBOX_CLASS}`).forEach(cb => {
-          if (selectionMode === 'all') cb.checked = true;
-          if (selectionMode === 'ai') cb.checked = cb.classList.contains('model');
-          if (selectionMode === 'none') cb.checked = false;
-        });
+      try {
+        await this.scrollToLoadAll();
+        this.checkboxManager.injectCheckboxes();
+        if (selectionMode && selectionMode !== 'custom') {
+          document.querySelectorAll(`.${CONFIG.CHECKBOX_CLASS}`).forEach(cb => {
+            if (selectionMode === 'all') cb.checked = true;
+            if (selectionMode === 'ai') cb.checked = cb.classList.contains('model');
+            if (selectionMode === 'none') cb.checked = false;
+          });
+        }
+
+        const snapshots = await this.collectMessageSnapshots(selectionMode);
+
+        if (snapshots.length === 0) {
+          throw new Error('Could not find any ChatGPT messages on this page.');
+        }
+
+        if (selectionMode === 'custom' && !this.checkboxManager.anyChecked()) {
+          throw new Error('Messages were found, but the exporter could not classify them for selection.');
+        }
+
+        const title = this.getConversationTitle();
+        const markdown = this.buildMarkdownFromSnapshots(snapshots, title);
+        const filenameBase = this.generateFilename(customFilename, title);
+
+        await this.export(markdown, mode, filenameBase);
+      } finally {
+        await this.restoreCopyCaptureManager();
       }
-
-      const turns = this.getTurns();
-      if (turns.length === 0) {
-        throw new Error('Could not find any ChatGPT conversation turns on this page.');
-      }
-
-      if (!this.checkboxManager.anyChecked()) {
-        throw new Error('Messages were found, but the exporter could not classify them for selection.');
-      }
-
-      const title = this.getConversationTitle();
-      const markdown = await this.buildMarkdown(turns, title);
-      const filenameBase = this.generateFilename(customFilename, title);
-
-      await this.export(markdown, mode, filenameBase);
     }
   }
 
@@ -634,7 +982,12 @@
     }
 
     observeVisibility() {
+      let observer = null;
+      let storageDisabled = false;
+
       const update = () => {
+        if (storageDisabled) return;
+
         try {
           if (chrome?.storage?.sync) {
             chrome.storage.sync.get(['hideExportBtn'], (result) => {
@@ -642,21 +995,29 @@
             });
           }
         } catch (error) {
-          console.error('Storage access error:', error);
+          storageDisabled = true;
+          observer?.disconnect();
+          console.warn('Storage access disabled; reload the ChatGPT tab after reloading the extension.', error);
         }
       };
 
       update();
 
-      const observer = new MutationObserver(update);
+      observer = new MutationObserver(update);
       observer.observe(document.body, { childList: true, subtree: true });
 
-      if (chrome?.storage?.onChanged) {
-        chrome.storage.onChanged.addListener((changes, area) => {
-          if (area === 'sync' && 'hideExportBtn' in changes) {
-            update();
-          }
-        });
+      try {
+        if (chrome?.storage?.onChanged) {
+          chrome.storage.onChanged.addListener((changes, area) => {
+            if (area === 'sync' && 'hideExportBtn' in changes) {
+              update();
+            }
+          });
+        }
+      } catch (error) {
+        storageDisabled = true;
+        observer?.disconnect();
+        console.warn('Storage change listener disabled; reload the ChatGPT tab after reloading the extension.', error);
       }
     }
   }
