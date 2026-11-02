@@ -22,13 +22,15 @@
     SELECTORS: {
       CONVERSATION_TURNS: [
         'section[data-testid^="conversation-turn-"][data-turn]',
-        'article[data-testid^="conversation-turn-"]'
+        'article[data-testid^="conversation-turn-"]',
+        '[data-chatgpt-search-unit-key$=":user"]',
+        '[data-chatgpt-search-unit-key$=":assistant"]'
       ],
-      MESSAGE_NODE: '[data-message-author-role]',
-      ASSISTANT_MARKDOWN: '[data-message-author-role="assistant"] .markdown',
+      MESSAGE_NODE: '[data-message-author-role], [data-chatgpt-search-unit-key$=":user"], [data-chatgpt-search-unit-key$=":assistant"]',
+      ASSISTANT_MARKDOWN: '[data-message-author-role="assistant"] .markdown, [data-markdown-text-style="assistant-message"]',
       ASSISTANT_TEXT: '[data-message-author-role="assistant"], .markdown, .prose',
       USER_TEXT: '[data-message-author-role="user"] .whitespace-pre-wrap, .whitespace-pre-wrap',
-      COPY_BUTTON: 'button[data-testid="copy-turn-action-button"]',
+      COPY_BUTTON: 'button[data-testid="copy-turn-action-button"], button[aria-label="Copy message"], button[aria-label="Copy response"]',
       THREAD_TITLE: 'main h1'
     },
 
@@ -127,12 +129,17 @@
         });
       });
 
-      return turns.sort((a, b) => {
+      return turns.filter(turn => !turns.some(other => other !== turn && other.contains(turn))).sort((a, b) => {
         const position = a.compareDocumentPosition(b);
         if (position & Node.DOCUMENT_POSITION_PRECEDING) return 1;
         if (position & Node.DOCUMENT_POSITION_FOLLOWING) return -1;
         return 0;
       });
+    },
+
+    getAuthorRole(node) {
+      return node?.dataset.messageAuthorRole ||
+        node?.getAttribute('data-chatgpt-search-unit-key')?.split(':').pop();
     },
 
     normalizeText(text) {
@@ -148,7 +155,8 @@
   // ============================================================================
   class CheckboxManager {
     resolveTurnRole(turn) {
-      const messageRole = turn.querySelector(CONFIG.SELECTORS.MESSAGE_NODE)?.dataset.messageAuthorRole;
+      const messageRole = Utils.getAuthorRole(turn) ||
+        Utils.getAuthorRole(turn.querySelector(CONFIG.SELECTORS.MESSAGE_NODE));
       if (messageRole === 'user') return 'user';
       if (messageRole === 'assistant') return 'model';
 
@@ -362,8 +370,10 @@
 
     getMessageRecords() {
       return Array.from(document.querySelectorAll(CONFIG.SELECTORS.MESSAGE_NODE))
+        .filter(node => !Array.from(node.querySelectorAll(CONFIG.SELECTORS.MESSAGE_NODE))
+          .some(child => Utils.getAuthorRole(child) === Utils.getAuthorRole(node)))
         .map((node, index) => {
-          const authorRole = node.dataset.messageAuthorRole;
+          const authorRole = Utils.getAuthorRole(node);
           const role = authorRole === 'assistant'
             ? 'model'
             : authorRole === 'user'
@@ -385,7 +395,8 @@
     getTurnForMessageNode(node) {
       return CONFIG.SELECTORS.CONVERSATION_TURNS
         .map(selector => node.closest(selector))
-        .find(Boolean) || node;
+        .filter(Boolean)
+        .sort((a, b) => a.contains(b) ? -1 : b.contains(a) ? 1 : 0)[0] || node;
     }
 
     getChatContainer() {
@@ -437,6 +448,11 @@
       const turnId = record.turn?.getAttribute?.('data-testid') || '';
       if (turnId) return `${record.role}:${turnId}`;
 
+      const messageId = record.node.getAttribute('data-message-id') ||
+        record.node.getAttribute('data-chatgpt-search-message-ids')?.trim().split(/\s+/)[0] ||
+        record.node.getAttribute('data-chatgpt-search-unit-key');
+      if (messageId) return `${record.role}:${messageId}`;
+
       const text = Utils.normalizeText(record.node.textContent || '');
       return `${record.role}:${text.slice(0, 240)}`;
     }
@@ -444,7 +460,13 @@
     getTurnNumber(record) {
       const turnId = record.turn?.getAttribute?.('data-testid') || '';
       const match = turnId.match(/conversation-turn-(\d+)/);
-      return match ? Number(match[1]) : Number.MAX_SAFE_INTEGER;
+      const searchKey = record.node.getAttribute('data-chatgpt-search-unit-key') || '';
+      // Search keys contain a conversation turn followed by a position *within*
+      // that turn. Sorting on the latter groups all user messages (position 0).
+      const searchMatch = searchKey.match(/^fallback-turn-(\d+):(\d+):(?:user|assistant)$/);
+      if (match) return Number(match[1]);
+      if (searchMatch) return Number(searchMatch[1]) + Number(searchMatch[2]) / 1000000;
+      return Number.MAX_SAFE_INTEGER;
     }
 
     shouldIncludeRecord(record, selectionMode) {
@@ -742,7 +764,7 @@
     }
 
     getUserText(turnOrNode, messageNode) {
-      const scopedUserNode = messageNode?.dataset.messageAuthorRole === 'user'
+      const scopedUserNode = Utils.getAuthorRole(messageNode) === 'user'
         ? messageNode
         : turnOrNode?.matches?.('[data-message-author-role="user"]')
           ? turnOrNode
@@ -754,17 +776,60 @@
       return this.getVisibleText(userTextNode || scopedUserNode);
     }
 
+    getMarkdownText(root) {
+      const render = node => {
+        if (node.nodeType === Node.TEXT_NODE) return node.textContent;
+        if (node.nodeType !== Node.ELEMENT_NODE) return '';
+        if (node.matches('button, svg, script, style, noscript, [hidden], [aria-hidden="true"], [data-markdown-copy="exclude"], .' + CONFIG.CHECKBOX_CLASS)) return '';
+        if (node.matches('[data-code-block="true"], pre')) {
+          const editor = node.querySelector('.cm-content');
+          const code = editor
+            ? Array.from(editor.querySelectorAll('.cm-line')).map(line => line.textContent).join('\n')
+            : (node.querySelector('code') || node).textContent;
+          const language = editor?.getAttribute('data-language') ||
+            node.querySelector('code')?.className.match(/language-([\w+-]+)/)?.[1] || '';
+          const fence = '`'.repeat(Math.max(3, ...Array.from(code.matchAll(/`+/g), match => match[0].length + 1)));
+          return `\n\n${fence}${language}\n${code.replace(/\n$/, '')}\n${fence}\n\n`;
+        }
+        const content = Array.from(node.childNodes).map(render).join('');
+        const tag = node.tagName.toLowerCase();
+        if (/^h[1-6]$/.test(tag)) return `\n\n${'#'.repeat(Number(tag[1]))} ${content.trim()}\n\n`;
+        if (tag === 'strong' || node.hasAttribute('data-d-default-strong')) return `**${content}**`;
+        if (tag === 'em') return `*${content}*`;
+        if (tag === 'code') return `\`${content}\``;
+        if (tag === 'a') return `[${content}](${node.getAttribute('href') || ''})`;
+        if (tag === 'br') return '\n';
+        if (tag === 'hr' || node.matches('[data-d-component="divider"]')) return '\n\n---\n\n';
+        if (tag === 'li') {
+          const marker = node.parentElement.tagName === 'OL'
+            ? `${Array.from(node.parentElement.children).indexOf(node) + 1}.` : '-';
+          return `${marker} ${content.trim().replace(/\n/g, '\n  ')}\n`;
+        }
+        if (tag === 'table') {
+          const rows = Array.from(node.rows).map(row => Array.from(row.cells)
+            .map(cell => render(cell).trim().replace(/\n+/g, ' ').replace(/\|/g, '\\|')));
+          if (!rows.length) return '';
+          const lines = rows.map(row => `| ${row.join(' | ')} |`);
+          lines.splice(1, 0, `| ${rows[0].map(() => '---').join(' | ')} |`);
+          return '\n\n' + lines.join('\n') + '\n\n';
+        }
+        if (['p', 'ul', 'ol', 'blockquote'].includes(tag)) return `\n\n${content.trim()}\n\n`;
+        return content;
+      };
+      return Utils.normalizeText(render(root).replace(/\n{3,}/g, '\n\n'));
+    }
+
     getModelText(turnOrNode, messageNode) {
       const markdownNode = turnOrNode.querySelector?.(CONFIG.SELECTORS.ASSISTANT_MARKDOWN) ||
         (turnOrNode.matches?.('.markdown') ? turnOrNode : null);
-      const assistantNode = messageNode?.dataset.messageAuthorRole === 'assistant'
+      const assistantNode = Utils.getAuthorRole(messageNode) === 'assistant'
         ? messageNode
         : turnOrNode.matches?.('[data-message-author-role="assistant"]')
           ? turnOrNode
           : turnOrNode.querySelector?.('[data-message-author-role="assistant"]');
       const assistantTextNode = turnOrNode.querySelector?.(CONFIG.SELECTORS.ASSISTANT_TEXT);
 
-      return this.getVisibleText(markdownNode || assistantNode || assistantTextNode || turnOrNode);
+      return this.getMarkdownText(markdownNode || assistantNode || assistantTextNode || turnOrNode);
     }
 
     getMessageText(turnOrNode, role) {
